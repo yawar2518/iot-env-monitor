@@ -1,0 +1,64 @@
+# =============================================================
+# IoT Environmental Monitoring — CI Pipeline
+# Runs on every push to dev and main.
+# On PR to main: must pass before merge is allowed.
+# =============================================================
+
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # -------------------------------------------------------------
+  # LINT — Python code quality check
+  # Runs flake8 on all backend Python files.
+  # Fails the build if there are syntax errors or style violations.
+  # -------------------------------------------------------------
+  lint:
+    name: Lint Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install flake8
+        run: pip install flake8==7.1.1
+
+      - name: Run flake8
+        run: |
+          flake8 backend/ \
+            --max-line-length=120 \
+            --exclude=backend/apps/*/migrations/,backend/.venv/ \
+            --ignore=E501,W503
+
+  # -------------------------------------------------------------
+  # DOCKER — Validate compose config and build images
+  # Confirms docker-compose.yml is valid and all images build.
+  # -------------------------------------------------------------
+  docker:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Validate Docker Compose config
+        run: docker compose config --quiet
+
+      - name: Build all images
+        run: docker compose build

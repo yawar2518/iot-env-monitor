@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Mosquitto generated password file
+infra/mosquitto/passwd

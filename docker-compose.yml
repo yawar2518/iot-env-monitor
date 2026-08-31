@@ -1,0 +1,249 @@
+# =============================================================
+# IoT Environmental Monitoring System — Docker Compose (Local)
+# =============================================================
+# Usage:
+#   docker compose up --build        # first run
+#   docker compose up                # subsequent runs
+#   docker compose down              # stop all services
+#   docker compose down -v           # stop and wipe all volumes (fresh start)
+# =============================================================
+
+services:
+
+  # -----------------------------------------------------------
+  # REDIS
+  # Shared by Celery (task queue) and Django Channels (WebSocket layer).
+  # No configuration needed — defaults are fine for local dev.
+  # -----------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: iot_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # TIMESCALEDB (PostgreSQL + time-series extension)
+  # Uses the official TimescaleDB image which bundles PostgreSQL 15.
+  # On first boot, Docker runs infra/postgres/init.sql automatically
+  # via the docker-entrypoint-initdb.d mechanism.
+  # -----------------------------------------------------------
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: iot_db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # MOSQUITTO MQTT BROKER
+  # Handles all device <-> backend messaging.
+  # Config and ACL files are mounted from infra/mosquitto/.
+  # -----------------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: iot_mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # WebSocket (for browser-based MQTT clients if needed)
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/acl.conf:/mosquitto/config/acl.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_logs:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -p 1883 -t '$$SYS/#' -C 1 -u ${MQTT_BACKEND_USERNAME} -P ${MQTT_BACKEND_PASSWORD} -E 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    env_file:
+      - .env
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # DJANGO (Daphne ASGI server)
+  # Runs the full Django application including REST API and
+  # Django Channels WebSocket consumers.
+  # Daphne replaces Gunicorn because we need ASGI for Channels.
+  # -----------------------------------------------------------
+  django:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iot_django
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.local
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py collectstatic --noinput &&
+             daphne -b 0.0.0.0 -p 8000 core.asgi:application"
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # MQTT SUBSCRIBER SERVICE
+  # A long-running Django management command that connects to
+  # Mosquitto, subscribes to all device telemetry topics, and
+  # writes incoming readings to TimescaleDB.
+  # Runs as a separate container so it doesn't block the API.
+  # -----------------------------------------------------------
+  mqtt_subscriber:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iot_mqtt_subscriber
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.local
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    command: python manage.py run_mqtt_subscriber
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # CELERY WORKER
+  # Processes background tasks: alert evaluation, notifications.
+  # Uses the same Docker image as Django — no separate Dockerfile needed.
+  # -----------------------------------------------------------
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iot_celery
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.local
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A core worker -l info
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # CELERY BEAT (Scheduler)
+  # Triggers periodic tasks on a schedule — e.g. evaluate alert
+  # thresholds every 60 seconds.
+  # -----------------------------------------------------------
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iot_celery_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings.local
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      celery:
+        condition: service_started
+    command: celery -A core beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    networks:
+      - iot_network
+
+  # -----------------------------------------------------------
+  # REACT FRONTEND (Vite dev server)
+  # In local dev, Vite runs its own hot-reload server on port 5173.
+  # In production this is replaced by an nginx container serving
+  # the built static files (see docker-compose.prod.yml).
+  # -----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: iot_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
+    depends_on:
+      - django
+    networks:
+      - iot_network
+
+
+# =============================================================
+# NAMED VOLUMES
+# Persist data across container restarts.
+# =============================================================
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_logs:
+
+
+# =============================================================
+# NETWORKS
+# All services share one internal network.
+# Services reach each other by container name (e.g. "db", "redis").
+# =============================================================
+networks:
+  iot_network:
+    driver: bridge

@@ -219,3 +219,6 @@ __marimo__/
 
 # Mosquitto generated password file
 infra/mosquitto/passwd
+
+# Django generated output
+backend/staticfiles/

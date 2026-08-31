@@ -56,10 +56,7 @@ THIRD_PARTY_APPS = [
 
     # Celery beat schedule stored in DB
     'django_celery_beat',
-
-    # Django debug toolbar — active only in local.py
-    # Listed here so migrations work across environments
-    'debug_toolbar',
+    
 ]
 
 LOCAL_APPS = [

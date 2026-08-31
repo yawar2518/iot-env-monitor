@@ -4,6 +4,7 @@
 # Environment-specific overrides live in local.py / production.py
 # =============================================================
 
+from datetime import timedelta
 from pathlib import Path
 from decouple import config
 
@@ -218,8 +219,6 @@ REST_FRAMEWORK = {
 # =============================================================
 # JWT SETTINGS
 # =============================================================
-
-from datetime import timedelta
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
